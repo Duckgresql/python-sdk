@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "duckgresql"
+dynamic = ["version"]
+description = "Python SDK for DuckGresQL — DuckDB-compatible API for remote databases"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "DuckGresQL Team" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pyarrow>=18.0.0",
+    "httpx>=0.28",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0"]
+numpy = ["numpy>=1.26"]
+all = ["pandas>=2.0", "numpy>=1.26"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "build",
+]
+
+[project.urls]
+Homepage = "https://github.com/duckgresql/duckgresql"
+Documentation = "https://github.com/duckgresql/duckgresql/tree/main/sdk/python"
+Repository = "https://github.com/duckgresql/duckgresql"
+
+[tool.uv]
+# Use .python-version for the Python version (3.13).
+# Install extras via: uv sync --extra dev --extra all (or make install).
+
+[tool.hatch.version]
+path = "src/duckgresql/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/duckgresql"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pandas"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
