@@ -9,6 +9,44 @@ import pyarrow.flight as flight
 
 from duckgresql.exceptions import AuthenticationError, ConnectionError, QueryError
 
+# ---------------------------------------------------------------------------
+# Minimal protobuf encoder for Flight SQL command descriptors
+# ---------------------------------------------------------------------------
+# The Arrow Flight SQL protocol requires GetFlightInfo/DoGet to receive a
+# FlightDescriptor whose `cmd` bytes are a serialised google.protobuf.Any
+# wrapping the appropriate command message (e.g. CommandStatementQuery).
+# Passing raw SQL bytes causes "proto: cannot parse invalid wire-format data".
+
+_COMMAND_TYPE_URL = (
+    "type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery"
+)
+
+
+def _varint(n: int) -> bytes:
+    result = bytearray()
+    while n > 0x7F:
+        result.append((n & 0x7F) | 0x80)
+        n >>= 7
+    result.append(n)
+    return bytes(result)
+
+
+def _pb_string(field: int, value: str) -> bytes:
+    data = value.encode("utf-8")
+    return _varint((field << 3) | 2) + _varint(len(data)) + data
+
+
+def _pb_bytes_field(field: int, value: bytes) -> bytes:
+    return _varint((field << 3) | 2) + _varint(len(value)) + value
+
+
+def _flight_sql_command(query: str) -> bytes:
+    """Return bytes for google.protobuf.Any(CommandStatementQuery{query})."""
+    # CommandStatementQuery { string query = 1; }
+    cmd = _pb_string(1, query)
+    # google.protobuf.Any { string type_url = 1; bytes value = 2; }
+    return _pb_string(1, _COMMAND_TYPE_URL) + _pb_bytes_field(2, cmd)
+
 
 class FlightSQLClient:
     """Thin wrapper around :class:`pyarrow.flight.FlightClient` for Flight SQL.
@@ -60,7 +98,7 @@ class FlightSQLClient:
     def execute_query(self, query: str) -> pa.Table:
         """Execute a read query and return the full result as a :class:`pyarrow.Table`."""
         try:
-            descriptor = flight.FlightDescriptor.for_command(query.encode("utf-8"))
+            descriptor = flight.FlightDescriptor.for_command(_flight_sql_command(query))
             opts = self._call_options()
             info = self._client.get_flight_info(descriptor, opts)
 
@@ -82,7 +120,7 @@ class FlightSQLClient:
             opts = self._call_options()
             # For DML we use the same descriptor path; the server decides
             # based on the SQL whether to return rows or an update count.
-            descriptor = flight.FlightDescriptor.for_command(query.encode("utf-8"))
+            descriptor = flight.FlightDescriptor.for_command(_flight_sql_command(query))
             info = self._client.get_flight_info(descriptor, opts)
 
             if not info.endpoints:

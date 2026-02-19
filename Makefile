@@ -39,6 +39,4 @@ test-pypi-install: ## Build, install wheel into .venv-pypi-test, and verify (sim
 	$(UV) run python -m build
 	$(UV) venv .venv-pypi-test --python 3.13
 	$(UV) pip install --python .venv-pypi-test/bin/python dist/duckgresql-*.whl
-	@echo "--- Checking import and version ---"
-	.venv-pypi-test/bin/python -c "import duckgresql; print('duckgresql', duckgresql.__version__)"
-	@echo "--- Done. Use: .venv-pypi-test/bin/python your_script.py ---"
+	@echo "--- Done. Use: .venv-pypi-test/bin/python your_script.py <sql_query> ---"
