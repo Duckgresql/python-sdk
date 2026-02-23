@@ -7,34 +7,41 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
-def _load_env() -> None:
-    """Load `.env` so that duckgresql uses those defaults.
+def _load_env(env_path: str | None = None) -> None:
+    """Load environment variables so that duckgresql uses those defaults.
 
-    Primero intenta cargar el `.env` en la raíz del repo (el padre de
-    esta carpeta `example/`), y luego uno en el directorio actual
-    por si quieres tener un `.env` específico.
+    If *env_path* is given, only that file is loaded.  Otherwise, the
+    ``.env`` at the repo root and the one in the current directory are
+    loaded (current directory wins).
     """
+
+    if env_path is not None:
+        load_dotenv(Path(env_path).resolve(), override=True)
+        return
 
     here = Path(__file__).resolve()
     repo_root = here.parent.parent
 
-    # .env en la raíz del repo (p. ej. /path/to/python-sdk/.env)
+    # .env at the repo root (e.g. /path/to/python-sdk/.env)
     load_dotenv(repo_root / ".env")
-    # .env en el directorio actual (sobrescribe si hace falta)
+    # .env in the current directory (overrides if present)
     load_dotenv()
 
 
 def main() -> None:
-    _load_env()
+    import argparse
 
-    # Importamos aquí para que ya estén cargadas las variables de entorno
+    parser = argparse.ArgumentParser(description="Run a SQL query against DuckGresQL")
+    parser.add_argument("query", help="SQL query to execute")
+    parser.add_argument("--env", default=None, help="Path to .env file (default: .env in repo root / cwd)")
+    args = parser.parse_args()
+
+    _load_env(args.env)
+
+    # Import after env is loaded so the SDK picks up the variables
     import duckgresql
 
-    if len(sys.argv) < 2:
-        print("Uso: python run_query.py '<consulta_sql>'")
-        raise SystemExit(1)
-
-    query = sys.argv[1]
+    query = args.query
 
     token = os.environ.get("DUCKGRESQL_TOKEN")
     database = os.environ.get("DUCKGRESQL_DATABASE")

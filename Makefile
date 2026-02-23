@@ -40,3 +40,16 @@ test-pypi-install: ## Build, install wheel into .venv-pypi-test, and verify (sim
 	$(UV) venv .venv-pypi-test --python 3.13
 	$(UV) pip install --python .venv-pypi-test/bin/python dist/duckgresql-*.whl
 	@echo "--- Done. Use: .venv-pypi-test/bin/python your_script.py <sql_query> ---"
+
+test-pypi-install-prod: ## Like test-pypi-install but with production defaults from .env.prod. Usage: make test-pypi-install-prod Q="SELECT 1"
+	@test -f .env.prod || { echo "Error: .env.prod not found. Copy .env.prod.example and fill in values."; exit 1; }
+	@test -n "$(Q)" || { echo "Error: query required. Usage: make test-pypi-install-prod Q=\"SELECT 1\""; exit 1; }
+	@# Load .env.prod, inject production config, build, restore dev config, then install
+	set -a && . ./.env.prod && set +a && $(UV) run python scripts/inject_release_defaults.py
+	$(UV) run python -m build
+	git checkout src/duckgresql/_config.py
+	rm -rf .venv-pypi-test
+	$(UV) venv .venv-pypi-test --python 3.13
+	$(UV) pip install --python .venv-pypi-test/bin/python dist/duckgresql-*.whl
+	$(UV) pip install --python .venv-pypi-test/bin/python python-dotenv
+	.venv-pypi-test/bin/python example/run_query.py --env .env.prod "$(Q)"

@@ -55,6 +55,7 @@ Thumbs.db
 
 # Local env / secrets
 .env
+.env.prod
 .env.local
 .env.*.local
 *.local

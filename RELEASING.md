@@ -72,10 +72,10 @@ git push origin main
 
 ```bash
 # Create annotated tag
-git tag -a sdk-python-v1.4.4.1 -m "Python SDK v1.4.4.1"
+git tag -a v1.4.4.1 -m "Python SDK v1.4.4.1"
 
 # Push tag to trigger release workflow
-git push origin sdk-python-v1.4.4.1
+git push origin v1.4.4.1
 ```
 
 ### 5. Monitor Release
@@ -126,19 +126,19 @@ python -c "import duckgresql; print(duckgresql.__version__)"
 ### Tag already exists
 ```bash
 # Delete local tag
-git tag -d sdk-python-v1.4.4.1
+git tag -d v1.4.4.1
 
 # Delete remote tag
-git push origin :refs/tags/sdk-python-v1.4.4.1
+git push origin :refs/tags/v1.4.4.1
 
 # Recreate and push
-git tag -a sdk-python-v1.4.4.1 -m "Python SDK v1.4.4.1"
-git push origin sdk-python-v1.4.4.1
+git tag -a v1.4.4.1 -m "Python SDK v1.4.4.1"
+git push origin v1.4.4.1
 ```
 
 ### Version mismatch error
 The workflow checks that the tag version matches `_version.py`. Ensure they match exactly:
-- Tag: `sdk-python-v1.4.4.1`
+- Tag: `v1.4.4.1`
 - Code: `__version__ = "1.4.4.1"`
 
 ### PyPI upload fails
@@ -154,7 +154,7 @@ The workflow checks that the tag version matches `_version.py`. Ensure they matc
 - Runs lint, type-check, tests, build
 
 ### `sdk-python-release.yml` (Release)
-- Triggered by tags matching `sdk-python-v*`
+- Triggered by tags matching `v*`
 - Verifies version, runs full test suite
 - Publishes to PyPI via Trusted Publishing
 - Creates GitHub Release with artifacts
