@@ -116,7 +116,7 @@ python -c "import duckgresql; print(duckgresql.__version__)"
    - Add a new publisher:
      - **Owner**: `duckgresql` (your GitHub org/user)
      - **Repository**: `duckgresql`
-     - **Workflow**: `sdk-python-release.yml`
+     - **Workflow**: `release.yml`
      - **Environment**: `pypi`
 
 3. **Done** — no API tokens needed!
@@ -148,12 +148,12 @@ The workflow checks that the tag version matches `_version.py`. Ensure they matc
 
 ## CI/CD Workflows
 
-### `sdk-python.yml` (Continuous Integration)
-- Runs on every push/PR to `sdk/python/**`
+### `check.yml` (Continuous Integration)
+- Runs on every push/PR to `main`
 - Tests on Python 3.11, 3.12, 3.13 (ensures compatibility)
 - Runs lint, type-check, tests, build
 
-### `sdk-python-release.yml` (Release)
+### `release.yml` (Release)
 - Triggered by tags matching `v*`
 - Verifies version, runs full test suite
 - Publishes to PyPI via Trusted Publishing
@@ -163,9 +163,9 @@ The workflow checks that the tag version matches `_version.py`. Ensure they matc
 
 - [ ] Version bumped in `_version.py`
 - [ ] Changelog updated
-- [ ] All tests passing locally (`make py-sdk-test`)
-- [ ] Lint clean (`make py-sdk-lint`)
-- [ ] Type-check passing (`make py-sdk-typecheck`)
+- [ ] All tests passing locally (`make test`)
+- [ ] Lint clean (`make lint`)
+- [ ] Type-check passing (`make typecheck`)
 - [ ] README.md updated (if needed)
 - [ ] GitHub repository variables set (`DUCKGRESQL_RELEASE_HOST`, `DUCKGRESQL_RELEASE_FLIGHT_PORT`, `DUCKGRESQL_RELEASE_REST_PORT`)
 - [ ] Committed and pushed to main
@@ -174,14 +174,8 @@ The workflow checks that the tag version matches `_version.py`. Ensure they matc
 ### Test release defaults locally
 
 ```bash
-export DUCKGRESQL_RELEASE_HOST=api.duckgresql.com
-export DUCKGRESQL_RELEASE_FLIGHT_PORT=47470
-export DUCKGRESQL_RELEASE_REST_PORT=3100
-make py-sdk-inject-defaults
-# Verify _config.py now has hardcoded values (not os.environ calls)
-cat sdk/python/src/duckgresql/_config.py
-# Restore dev config (git checkout)
-git checkout sdk/python/src/duckgresql/_config.py
+# Fill in .env.prod with production values (see .env.prod.example)
+make test-pypi-install-prod Q="SELECT 1"
 ```
 
 ## Post-Release Checklist
