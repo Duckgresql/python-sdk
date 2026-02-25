@@ -12,7 +12,7 @@ from duckgresql._config import (
     DEFAULT_REST_SCHEME,
     DEFAULT_USE_TLS,
 )
-from duckgresql._flight import FlightSQLClient
+from duckgresql._flight import FlightSQLClient, Parameters
 from duckgresql._rest import RestClient
 from duckgresql._types import _is_read_query
 from duckgresql.async_job import AsyncJob
@@ -66,27 +66,26 @@ class Duckgresql:
     def execute(
         self,
         query: str,
-        parameters: Sequence[Any] | None = None,
+        parameters: Parameters = None,
     ) -> DuckgresqlResult:
         """Execute *query* via Flight SQL and return a :class:`DuckgresqlResult`.
 
-        Read queries (SELECT, WITH, …) use ``execute_query``.
-        DML queries (INSERT, UPDATE, DELETE, …) use ``execute_update``.
+        Parameters are bound server-side.  Pass a list for positional
+        placeholders (``$1``, ``$2``, …) or a dict for named placeholders
+        (``$name``).
         """
         self._ensure_open()
-        sql = self._interpolate(query, parameters)
-
-        if _is_read_query(sql):
-            table = self._flight.execute_query(sql)
+        if _is_read_query(query):
+            table = self._flight.execute_query(query, parameters)
             return DuckgresqlResult(table)
         else:
-            affected = self._flight.execute_update(sql)
+            affected = self._flight.execute_update(query, parameters)
             return DuckgresqlResult(affected_rows=affected)
 
     def sql(
         self,
         query: str,
-        parameters: Sequence[Any] | None = None,
+        parameters: Parameters = None,
     ) -> DuckgresqlResult:
         """Alias for :meth:`execute`."""
         return self.execute(query, parameters)
@@ -94,29 +93,26 @@ class Duckgresql:
     def executemany(
         self,
         query: str,
-        parameters_list: Sequence[Sequence[Any]],
+        parameters_list: Sequence[Sequence[Any] | dict[str, Any]],
     ) -> DuckgresqlResult:
         """Execute *query* once per parameter set. Returns the last result."""
         self._ensure_open()
         total_affected = 0
         for params in parameters_list:
-            sql = self._interpolate(query, params)
-            total_affected += self._flight.execute_update(sql)
+            total_affected += self._flight.execute_update(query, params)
         return DuckgresqlResult(affected_rows=total_affected)
 
     def execute_async(
         self,
         query: str,
-        parameters: Sequence[Any] | None = None,
-        bindings: Any | None = None,
+        parameters: Parameters = None,
     ) -> AsyncJob:
         """Submit *query* for asynchronous execution via REST.
 
         Returns an :class:`AsyncJob` that can be polled for results.
         """
         self._ensure_open()
-        sql = self._interpolate(query, parameters)
-        job_id = self._rest.submit_async(self._conn_token, sql, bindings)
+        job_id = self._rest.submit_async(self._conn_token, query, parameters)
         return AsyncJob(self._rest, self._conn_token, job_id)
 
     # ------------------------------------------------------------------
@@ -147,26 +143,3 @@ class Duckgresql:
     def _ensure_open(self) -> None:
         if self._closed:
             raise ConnectionError("Connection is closed")
-
-    @staticmethod
-    def _interpolate(query: str, parameters: Sequence[Any] | None) -> str:
-        """Replace positional ``$1``, ``$2``, … placeholders with literal values.
-
-        This is a convenience for simple parameter substitution client-side.
-        For production use, rely on server-side parameter binding via
-        ``execute_async(bindings=...)``.
-        """
-        if not parameters:
-            return query
-        sql = query
-        for i, val in enumerate(parameters, start=1):
-            placeholder = f"${i}"
-            if isinstance(val, str):
-                escaped = val.replace("'", "''")
-                literal = f"'{escaped}'"
-            elif val is None:
-                literal = "NULL"
-            else:
-                literal = str(val)
-            sql = sql.replace(placeholder, literal)
-        return sql

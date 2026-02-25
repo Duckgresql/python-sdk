@@ -1,4 +1,4 @@
-.PHONY: help install test lint format typecheck inject-defaults build publish test-pypi-install
+.PHONY: help install test lint format typecheck inject-defaults build publish test-pypi-install test-pypi-install-pypi-prod
 
 # Default target
 .DEFAULT_GOAL := help
@@ -41,9 +41,10 @@ test-pypi-install: ## Build, install wheel into .venv-pypi-test, and verify (sim
 	$(UV) pip install --python .venv-pypi-test/bin/python dist/duckgresql-*.whl
 	@echo "--- Done. Use: .venv-pypi-test/bin/python your_script.py <sql_query> ---"
 
-test-pypi-install-prod: ## Like test-pypi-install but with production defaults from .env.prod. Usage: make test-pypi-install-prod Q="SELECT 1"
+# For parameterized queries use single quotes for Q so the shell doesn't expand $$ (e.g. Q='SELECT * FROM t WHERE id = $$1' P="[3]").
+test-pypi-install-prod: ## Like test-pypi-install but with production defaults. Usage: make test-pypi-install-prod Q="SELECT 1" or Q='SELECT * FROM t WHERE id = $$1' P="[3]"
 	@test -f .env.prod || { echo "Error: .env.prod not found. Copy .env.prod.example and fill in values."; exit 1; }
-	@test -n "$(Q)" || { echo "Error: query required. Usage: make test-pypi-install-prod Q=\"SELECT 1\""; exit 1; }
+	@test -n "$(Q)" || { echo "Error: query required. Use single quotes for parameterized Q: make test-pypi-install-prod Q='SELECT * FROM t WHERE id = \$$1' P=\"[3]\""; exit 1; }
 	@# Load .env.prod, inject production config, build, restore dev config, then install
 	set -a && . ./.env.prod && set +a && $(UV) run python scripts/inject_release_defaults.py
 	$(UV) run python -m build
@@ -52,4 +53,13 @@ test-pypi-install-prod: ## Like test-pypi-install but with production defaults f
 	$(UV) venv .venv-pypi-test --python 3.13
 	$(UV) pip install --python .venv-pypi-test/bin/python dist/duckgresql-*.whl
 	$(UV) pip install --python .venv-pypi-test/bin/python python-dotenv
-	.venv-pypi-test/bin/python example/run_query.py --env .env.prod "$(Q)"
+	.venv-pypi-test/bin/python example/run_query.py --env .env.prod '$(Q)' --params '$(P)'
+
+test-pypi-install-pypi-prod: ## Install real duckgresql from PyPI and run query. Usage: make test-pypi-install-pypi-prod Q="SELECT 1" DUCKGRESQL_TOKEN=... DUCKGRESQL_DATABASE=...
+	@test -n "$(Q)" || { echo "Error: query required. Usage: make test-pypi-install-pypi-prod Q=\"SELECT 1\" DUCKGRESQL_TOKEN=... DUCKGRESQL_DATABASE=..."; exit 1; }
+	@test -n "$(DUCKGRESQL_TOKEN)" || { echo "Error: DUCKGRESQL_TOKEN required."; exit 1; }
+	@test -n "$(DUCKGRESQL_DATABASE)" || { echo "Error: DUCKGRESQL_DATABASE required."; exit 1; }
+	rm -rf .venv-pypi-test
+	$(UV) venv .venv-pypi-test --python 3.13
+	$(UV) pip install --python .venv-pypi-test/bin/python duckgresql python-dotenv
+	DUCKGRESQL_TOKEN="$(DUCKGRESQL_TOKEN)" DUCKGRESQL_DATABASE="$(DUCKGRESQL_DATABASE)" .venv-pypi-test/bin/python example/run_query.py "$(Q)"

@@ -13,7 +13,7 @@ from duckgresql._config import (
     DEFAULT_REST_SCHEME,
     DEFAULT_USE_TLS,
 )
-from duckgresql._flight import FlightSQLClient
+from duckgresql._flight import FlightSQLClient, Parameters
 from duckgresql._rest_async import AsyncRestClient
 from duckgresql._types import _is_read_query
 from duckgresql.async_job import AsyncJobAsync
@@ -78,23 +78,26 @@ class DuckgresqlAsync:
     async def execute(
         self,
         query: str,
-        parameters: Sequence[Any] | None = None,
+        parameters: Parameters = None,
     ) -> DuckgresqlResult:
         """Execute *query* via Flight SQL (in a thread) and return a result."""
         self._ensure_open()
-        sql = _interpolate(query, parameters)
 
-        if _is_read_query(sql):
-            table = await asyncio.to_thread(self._flight.execute_query, sql)
+        if _is_read_query(query):
+            table = await asyncio.to_thread(
+                self._flight.execute_query, query, parameters,
+            )
             return DuckgresqlResult(table)
         else:
-            affected = await asyncio.to_thread(self._flight.execute_update, sql)
+            affected = await asyncio.to_thread(
+                self._flight.execute_update, query, parameters,
+            )
             return DuckgresqlResult(affected_rows=affected)
 
     async def sql(
         self,
         query: str,
-        parameters: Sequence[Any] | None = None,
+        parameters: Parameters = None,
     ) -> DuckgresqlResult:
         """Alias for :meth:`execute`."""
         return await self.execute(query, parameters)
@@ -102,27 +105,28 @@ class DuckgresqlAsync:
     async def executemany(
         self,
         query: str,
-        parameters_list: Sequence[Sequence[Any]],
+        parameters_list: Sequence[Sequence[Any] | dict[str, Any]],
     ) -> DuckgresqlResult:
         """Execute *query* once per parameter set."""
         self._ensure_open()
         total_affected = 0
         for params in parameters_list:
-            sql = _interpolate(query, params)
-            affected = await asyncio.to_thread(self._flight.execute_update, sql)
+            affected = await asyncio.to_thread(
+                self._flight.execute_update, query, params,
+            )
             total_affected += affected
         return DuckgresqlResult(affected_rows=total_affected)
 
     async def execute_async(
         self,
         query: str,
-        parameters: Sequence[Any] | None = None,
-        bindings: Any | None = None,
+        parameters: Parameters = None,
     ) -> AsyncJobAsync:
         """Submit *query* for async execution. Returns an :class:`AsyncJobAsync`."""
         self._ensure_open()
-        sql = _interpolate(query, parameters)
-        job_id = await self._rest.submit_async(self._conn_token, sql, bindings)
+        job_id = await self._rest.submit_async(
+            self._conn_token, query, parameters,
+        )
         return AsyncJobAsync(self._rest, self._conn_token, job_id)
 
     # ------------------------------------------------------------------
@@ -153,21 +157,3 @@ class DuckgresqlAsync:
     def _ensure_open(self) -> None:
         if self._closed:
             raise ConnectionError("Connection is closed")
-
-
-def _interpolate(query: str, parameters: Sequence[Any] | None) -> str:
-    """Replace ``$1``, ``$2``, … placeholders with literal values."""
-    if not parameters:
-        return query
-    sql = query
-    for i, val in enumerate(parameters, start=1):
-        placeholder = f"${i}"
-        if isinstance(val, str):
-            escaped = val.replace("'", "''")
-            literal = f"'{escaped}'"
-        elif val is None:
-            literal = "NULL"
-        else:
-            literal = str(val)
-        sql = sql.replace(placeholder, literal)
-    return sql

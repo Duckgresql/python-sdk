@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from typing import cast
+from collections.abc import Mapping, Sequence
+from typing import Any, Union, cast
 
 import pyarrow as pa
 import pyarrow.flight as flight
 
 from duckgresql.exceptions import AuthenticationError, ConnectionError, QueryError
+
+#: Accepted parameter types: positional sequence or named dict.
+Parameters = Union[Sequence[Any], dict[str, Any], None]
 
 # ---------------------------------------------------------------------------
 # Minimal protobuf encoder for Flight SQL command descriptors
@@ -19,6 +23,15 @@ from duckgresql.exceptions import AuthenticationError, ConnectionError, QueryErr
 
 _COMMAND_TYPE_URL = (
     "type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery"
+)
+_CREATE_PREPARED_TYPE_URL = (
+    "type.googleapis.com/arrow.flight.protocol.sql.ActionCreatePreparedStatementRequest"
+)
+_PREPARED_QUERY_TYPE_URL = (
+    "type.googleapis.com/arrow.flight.protocol.sql.CommandPreparedStatementQuery"
+)
+_CLOSE_PREPARED_TYPE_URL = (
+    "type.googleapis.com/arrow.flight.protocol.sql.ActionClosePreparedStatementRequest"
 )
 
 
@@ -42,10 +55,114 @@ def _pb_bytes_field(field: int, value: bytes) -> bytes:
 
 def _flight_sql_command(query: str) -> bytes:
     """Return bytes for google.protobuf.Any(CommandStatementQuery{query})."""
-    # CommandStatementQuery { string query = 1; }
     cmd = _pb_string(1, query)
-    # google.protobuf.Any { string type_url = 1; bytes value = 2; }
     return _pb_string(1, _COMMAND_TYPE_URL) + _pb_bytes_field(2, cmd)
+
+
+# ---------------------------------------------------------------------------
+# Prepared statement protobuf helpers
+# ---------------------------------------------------------------------------
+
+def _create_prepared_statement_request(query: str) -> bytes:
+    """Encode ActionCreatePreparedStatementRequest wrapped in google.protobuf.Any."""
+    inner = _pb_string(1, query)
+    return _pb_string(1, _CREATE_PREPARED_TYPE_URL) + _pb_bytes_field(2, inner)
+
+
+def _prepared_statement_query(handle: bytes) -> bytes:
+    """Encode CommandPreparedStatementQuery wrapped in google.protobuf.Any."""
+    inner = _pb_bytes_field(1, handle)
+    return _pb_string(1, _PREPARED_QUERY_TYPE_URL) + _pb_bytes_field(2, inner)
+
+
+def _close_prepared_statement_request(handle: bytes) -> bytes:
+    """Encode ActionClosePreparedStatementRequest wrapped in google.protobuf.Any."""
+    inner = _pb_bytes_field(1, handle)
+    return _pb_string(1, _CLOSE_PREPARED_TYPE_URL) + _pb_bytes_field(2, inner)
+
+
+def _parse_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """Read a varint from *data* starting at *offset*. Returns (value, new_offset)."""
+    result = 0
+    shift = 0
+    while offset < len(data):
+        b = data[offset]
+        offset += 1
+        result |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            return result, offset
+        shift += 7
+    raise ValueError("truncated varint")
+
+
+def _parse_prepared_statement_result(body: bytes) -> bytes:
+    """Parse ActionCreatePreparedStatementResult and extract prepared_statement_handle.
+
+    The result is a google.protobuf.Any wrapping the result message.
+    We look for field 1 (bytes) = prepared_statement_handle inside the inner value.
+    """
+    # First, unwrap the google.protobuf.Any envelope to get the inner value.
+    # Any { string type_url = 1; bytes value = 2; }
+    inner_value = body
+    offset = 0
+    while offset < len(body):
+        tag, offset = _parse_varint(body, offset)
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 2:  # length-delimited
+            length, offset = _parse_varint(body, offset)
+            field_data = body[offset:offset + length]
+            offset += length
+            if field_number == 2:
+                inner_value = field_data
+                break
+        elif wire_type == 0:  # varint
+            _, offset = _parse_varint(body, offset)
+        elif wire_type == 5:  # 32-bit
+            offset += 4
+        elif wire_type == 1:  # 64-bit
+            offset += 8
+        else:
+            raise ValueError(f"unsupported wire type {wire_type}")
+
+    # Now parse the inner message: ActionCreatePreparedStatementResult
+    # { bytes prepared_statement_handle = 1; ... }
+    offset = 0
+    while offset < len(inner_value):
+        tag, offset = _parse_varint(inner_value, offset)
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 2:
+            length, offset = _parse_varint(inner_value, offset)
+            field_data = inner_value[offset:offset + length]
+            offset += length
+            if field_number == 1:
+                return field_data
+        elif wire_type == 0:
+            _, offset = _parse_varint(inner_value, offset)
+        elif wire_type == 5:
+            offset += 4
+        elif wire_type == 1:
+            offset += 8
+        else:
+            raise ValueError(f"unsupported wire type {wire_type}")
+
+    raise ValueError("prepared_statement_handle not found in result")
+
+
+# ---------------------------------------------------------------------------
+# Parameter batch builder
+# ---------------------------------------------------------------------------
+
+def _build_params_batch(parameters: Sequence[Any] | dict[str, Any]) -> pa.RecordBatch:
+    """Build a single-row RecordBatch from positional or named parameters."""
+    if isinstance(parameters, Mapping):
+        arrays = [pa.array([v]) for v in parameters.values()]
+        names = list(parameters.keys())
+    else:
+        arrays = [pa.array([v]) for v in parameters]
+        names = [str(i) for i in range(len(parameters))]
+    return pa.record_batch(arrays, names=names)
 
 
 class FlightSQLClient:
@@ -91,18 +208,69 @@ class FlightSQLClient:
         """Build call options with the bearer token from the handshake."""
         return flight.FlightCallOptions(headers=[self._auth_header])
 
+    def _execute_prepared(self, query: str, parameters: Sequence[Any] | dict[str, Any]) -> pa.Table:
+        """Execute a query using the prepared statement RPC sequence.
+
+        1. CreatePreparedStatement → handle
+        2. DoPut with parameter RecordBatch → bind
+        3. GetFlightInfo with handle → endpoints
+        4. DoGet → results
+        5. ClosePreparedStatement (in finally)
+        """
+        opts = self._call_options()
+        handle: bytes | None = None
+        try:
+            # 1. Create prepared statement
+            action_body = _create_prepared_statement_request(query)
+            action = flight.Action("CreatePreparedStatement", action_body)
+            results = list(self._client.do_action(action, opts))
+            if not results:
+                raise QueryError("CreatePreparedStatement returned no result")
+            handle = _parse_prepared_statement_result(results[0].body.to_pybytes())
+
+            # 2. Bind parameters via DoPut
+            batch = _build_params_batch(parameters)
+            cmd = _prepared_statement_query(handle)
+            descriptor = flight.FlightDescriptor.for_command(cmd)
+            writer, _ = self._client.do_put(descriptor, batch.schema, opts)
+            writer.write_batch(batch)
+            writer.done_writing()
+            writer.close()
+
+            # 3. GetFlightInfo to get endpoints
+            info = self._client.get_flight_info(descriptor, opts)
+            if not info.endpoints:
+                return pa.table({})
+
+            # 4. DoGet to fetch results
+            ticket = info.endpoints[0].ticket
+            reader = self._client.do_get(ticket, opts)
+            return reader.read_all()
+        finally:
+            # 5. Close prepared statement
+            if handle is not None:
+                try:
+                    close_body = _close_prepared_statement_request(handle)
+                    close_action = flight.Action("ClosePreparedStatement", close_body)
+                    list(self._client.do_action(close_action, opts))
+                except Exception:
+                    pass  # best-effort cleanup
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def execute_query(self, query: str) -> pa.Table:
+    def execute_query(self, query: str, parameters: Parameters = None) -> pa.Table:
         """Execute a read query and return the full result as a :class:`pyarrow.Table`."""
         try:
-            descriptor = flight.FlightDescriptor.for_command(_flight_sql_command(query))
+            if parameters is not None:
+                return self._execute_prepared(query, parameters)
+
+            descriptor = flight.FlightDescriptor.for_command(
+                _flight_sql_command(query),
+            )
             opts = self._call_options()
             info = self._client.get_flight_info(descriptor, opts)
-
-            # Flight SQL returns one or more endpoints; read the first.
             if not info.endpoints:
                 return pa.table({})
 
@@ -111,24 +279,29 @@ class FlightSQLClient:
             return reader.read_all()
         except flight.FlightUnauthenticatedError as exc:
             raise AuthenticationError(str(exc)) from exc
+        except QueryError:
+            raise
         except Exception as exc:
             raise QueryError(f"Query execution failed: {exc}") from exc
 
-    def execute_update(self, query: str) -> int:
+    def execute_update(self, query: str, parameters: Parameters = None) -> int:
         """Execute a DML statement and return the number of affected rows."""
         try:
-            opts = self._call_options()
-            # For DML we use the same descriptor path; the server decides
-            # based on the SQL whether to return rows or an update count.
-            descriptor = flight.FlightDescriptor.for_command(_flight_sql_command(query))
-            info = self._client.get_flight_info(descriptor, opts)
+            if parameters is not None:
+                table = self._execute_prepared(query, parameters)
+            else:
+                opts = self._call_options()
+                descriptor = flight.FlightDescriptor.for_command(
+                    _flight_sql_command(query),
+                )
+                info = self._client.get_flight_info(descriptor, opts)
 
-            if not info.endpoints:
-                return 0
+                if not info.endpoints:
+                    return 0
 
-            ticket = info.endpoints[0].ticket
-            reader = self._client.do_get(ticket, opts)
-            table = reader.read_all()
+                ticket = info.endpoints[0].ticket
+                reader = self._client.do_get(ticket, opts)
+                table = reader.read_all()
 
             # The server returns a single-row table with the affected count
             # when the statement is DML. If it returns regular rows, return
@@ -138,6 +311,8 @@ class FlightSQLClient:
             return cast(int, table.num_rows)
         except flight.FlightUnauthenticatedError as exc:
             raise AuthenticationError(str(exc)) from exc
+        except QueryError:
+            raise
         except Exception as exc:
             raise QueryError(f"Update execution failed: {exc}") from exc
 

@@ -19,6 +19,7 @@ from duckgresql._config import (
     DEFAULT_REST_SCHEME,
     DEFAULT_USE_TLS,
 )
+from duckgresql._flight import Parameters
 from duckgresql._types import JobStatus
 from duckgresql._version import __version__
 from duckgresql.async_connection import DuckgresqlAsync
@@ -114,6 +115,7 @@ __all__ = [
     "AsyncJob",
     "AsyncJobAsync",
     "JobStatus",
+    "Parameters",
     "DuckgresqlError",
     "ConnectionError",
     "AuthenticationError",
