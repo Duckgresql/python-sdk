@@ -21,7 +21,7 @@ def sample_table() -> pa.Table:
 
 def _make_prepared_handle_result(handle: bytes = b"test-handle") -> bytes:
     """Build a fake ActionCreatePreparedStatementResult wrapped in Any."""
-    from duckgresql._flight import _varint, _pb_string, _pb_bytes_field
+    from duckgresql._flight import _pb_bytes_field, _pb_string
 
     # ActionCreatePreparedStatementResult { bytes prepared_statement_handle = 1; }
     inner = _pb_bytes_field(1, handle)

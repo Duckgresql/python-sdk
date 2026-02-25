@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Union, cast
+from typing import Any, cast
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -11,7 +11,7 @@ import pyarrow.flight as flight
 from duckgresql.exceptions import AuthenticationError, ConnectionError, QueryError
 
 #: Accepted parameter types: positional sequence or named dict.
-Parameters = Union[Sequence[Any], dict[str, Any], None]
+Parameters = Sequence[Any] | dict[str, Any] | None
 
 # ---------------------------------------------------------------------------
 # Minimal protobuf encoder for Flight SQL command descriptors
@@ -208,7 +208,9 @@ class FlightSQLClient:
         """Build call options with the bearer token from the handshake."""
         return flight.FlightCallOptions(headers=[self._auth_header])
 
-    def _execute_prepared(self, query: str, parameters: Sequence[Any] | dict[str, Any]) -> pa.Table:
+    def _execute_prepared(
+        self, query: str, parameters: Sequence[Any] | dict[str, Any],
+    ) -> pa.Table:
         """Execute a query using the prepared statement RPC sequence.
 
         1. CreatePreparedStatement → handle

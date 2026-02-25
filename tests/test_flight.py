@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pyarrow.flight as pflight
@@ -187,11 +187,14 @@ class TestProtobufHelpers:
         assert off == 2
 
     def test_parse_prepared_statement_result(self) -> None:
-        from duckgresql._flight import _pb_string, _pb_bytes_field
+        from duckgresql._flight import _pb_bytes_field, _pb_string
 
         handle = b"my-handle-123"
         inner = _pb_bytes_field(1, handle)
-        type_url = "type.googleapis.com/arrow.flight.protocol.sql.ActionCreatePreparedStatementResult"
+        type_url = (
+            "type.googleapis.com/arrow.flight.protocol.sql"
+            ".ActionCreatePreparedStatementResult"
+        )
         body = _pb_string(1, type_url) + _pb_bytes_field(2, inner)
 
         parsed = _parse_prepared_statement_result(body)
