@@ -280,10 +280,10 @@ class FlightSQLClient:
 
         Each parameter is encoded as a ``ParamMsg`` object:
         - Positional: ``[{"v": 1234}, {"v": "hello"}]``
-        - Named:      ``[{"n": "id", "v": 1234}, {"n": "name", "v": "hello"}]``
+        - Named:      ``[{"n": true, "k": "id", "v": 1234}]``
         """
         if isinstance(parameters, Mapping):
-            params_array = [{"n": k, "v": v} for k, v in parameters.items()]
+            params_array = [{"n": True, "k": k, "v": v} for k, v in parameters.items()]
         else:
             params_array = [{"v": v} for v in parameters]
         encoded = base64.b64encode(json.dumps(params_array).encode()).decode()

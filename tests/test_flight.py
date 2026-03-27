@@ -123,7 +123,7 @@ class TestDirectParamsPath:
         call_opts = mock_flight_client.get_flight_info.call_args[0][1]
         headers = {k: v for k, v in call_opts.headers}
         decoded = json.loads(base64.b64decode(headers[b"x-params-json"]))
-        assert decoded == [{"n": "name", "v": "alice"}]
+        assert decoded == [{"n": True, "k": "name", "v": "alice"}]
 
     def test_fallback_to_prepared_on_unimplemented(
         self, mock_flight_client: MagicMock, sample_table: pa.Table
