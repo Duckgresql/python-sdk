@@ -26,6 +26,7 @@ class DuckgresqlResult:
 
         # Auto-detect DML results: server returns a single-row table with
         # an "affected_rows" column for write statements.
+        self._affected_rows: int | None
         if affected_rows is not None:
             self._affected_rows = affected_rows
         elif (
