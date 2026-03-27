@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import threading
+import time
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -200,37 +204,126 @@ class FlightSQLClient:
 
         self._closed = False
 
+        # Whether the server supports direct params via x-params-json header.
+        # None = not yet probed, True/False = probed result.
+        self._direct_params_supported: bool | None = None
+
+        # Cache: query → (handle_bytes, created_at)
+        # Server TTL is 5 min; we use 4 min to stay safe.
+        self._handle_cache: dict[str, tuple[bytes, float]] = {}
+        self._cache_ttl = 240.0  # 4 minutes
+        self._cache_lock = threading.Lock()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _call_options(self) -> flight.FlightCallOptions:
+    def _close_prepared_async(
+        self, handle: bytes, opts: flight.FlightCallOptions,
+    ) -> None:
+        """Close a prepared statement in a background thread (fire-and-forget)."""
+        def _close() -> None:
+            try:
+                close_body = _close_prepared_statement_request(handle)
+                close_action = flight.Action("ClosePreparedStatement", close_body)
+                list(self._client.do_action(close_action, opts))
+            except Exception:
+                pass  # best-effort cleanup
+
+        threading.Thread(target=_close, daemon=True).start()
+
+    def _get_or_create_handle(
+        self, query: str, opts: flight.FlightCallOptions,
+    ) -> tuple[bytes, bool]:
+        """Return (handle, from_cache). Creates a new handle if not cached or expired."""
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._handle_cache.get(query)
+            if cached is not None:
+                handle, created_at = cached
+                if now - created_at < self._cache_ttl:
+                    return handle, True
+                # Expired — remove and fall through
+                del self._handle_cache[query]
+
+        # Create new prepared statement (outside lock to avoid blocking)
+        action_body = _create_prepared_statement_request(query)
+        action = flight.Action("CreatePreparedStatement", action_body)
+        results = list(self._client.do_action(action, opts))
+        if not results:
+            raise QueryError("CreatePreparedStatement returned no result")
+        handle = _parse_prepared_statement_result(results[0].body.to_pybytes())
+
+        with self._cache_lock:
+            self._handle_cache[query] = (handle, time.monotonic())
+        return handle, False
+
+    def _evict_handle(self, query: str) -> None:
+        """Remove a handle from the cache (e.g. after a server error)."""
+        with self._cache_lock:
+            self._handle_cache.pop(query, None)
+
+    def _call_options(
+        self, extra_headers: list[tuple[bytes, bytes]] | None = None,
+    ) -> flight.FlightCallOptions:
         """Build call options with the bearer token from the handshake."""
-        return flight.FlightCallOptions(headers=[self._auth_header])
+        headers: list[tuple[bytes, bytes]] = [self._auth_header]
+        if extra_headers:
+            headers.extend(extra_headers)
+        return flight.FlightCallOptions(headers=headers)
+
+    @staticmethod
+    def _encode_params_header(
+        parameters: Sequence[Any] | dict[str, Any],
+    ) -> tuple[bytes, bytes]:
+        """Encode parameters as a base64 JSON gRPC metadata header.
+
+        Each parameter is encoded as a ``ParamMsg`` object:
+        - Positional: ``[{"v": 1234}, {"v": "hello"}]``
+        - Named:      ``[{"n": "id", "v": 1234}, {"n": "name", "v": "hello"}]``
+        """
+        if isinstance(parameters, Mapping):
+            params_array = [{"n": k, "v": v} for k, v in parameters.items()]
+        else:
+            params_array = [{"v": v} for v in parameters]
+        encoded = base64.b64encode(json.dumps(params_array).encode()).decode()
+        return (b"x-params-json", encoded.encode())
+
+    def _execute_direct(
+        self, query: str, parameters: Sequence[Any] | dict[str, Any],
+    ) -> pa.Table:
+        """Execute a parameterized query via the direct 2-RPC path.
+
+        Sends parameters as a base64-encoded JSON header (x-params-json)
+        alongside a standard CommandStatementQuery. 2 RPCs: GetFlightInfo → DoGet.
+        """
+        params_header = self._encode_params_header(parameters)
+        opts = self._call_options(extra_headers=[params_header])
+        descriptor = flight.FlightDescriptor.for_command(
+            _flight_sql_command(query),
+        )
+        info = self._client.get_flight_info(descriptor, opts)
+        if not info.endpoints:
+            return pa.table({})
+
+        ticket = info.endpoints[0].ticket
+        reader = self._client.do_get(ticket, opts)
+        return reader.read_all()
 
     def _execute_prepared(
         self, query: str, parameters: Sequence[Any] | dict[str, Any],
+        *, _retry: bool = True,
     ) -> pa.Table:
-        """Execute a query using the prepared statement RPC sequence.
+        """Execute a query using a cached or new prepared statement handle.
 
-        1. CreatePreparedStatement → handle
-        2. DoPut with parameter RecordBatch → bind
-        3. GetFlightInfo with handle → endpoints
-        4. DoGet → results
-        5. ClosePreparedStatement (in finally)
+        On cache hit: DoPut → GetFlightInfo → DoGet (3 RPCs)
+        On cache miss: CreatePreparedStatement → DoPut → GetFlightInfo → DoGet (4 RPCs)
         """
         opts = self._call_options()
-        handle: bytes | None = None
-        try:
-            # 1. Create prepared statement
-            action_body = _create_prepared_statement_request(query)
-            action = flight.Action("CreatePreparedStatement", action_body)
-            results = list(self._client.do_action(action, opts))
-            if not results:
-                raise QueryError("CreatePreparedStatement returned no result")
-            handle = _parse_prepared_statement_result(results[0].body.to_pybytes())
+        handle, from_cache = self._get_or_create_handle(query, opts)
 
-            # 2. Bind parameters via DoPut
+        try:
+            # Bind parameters via DoPut
             batch = _build_params_batch(parameters)
             cmd = _prepared_statement_query(handle)
             descriptor = flight.FlightDescriptor.for_command(cmd)
@@ -239,34 +332,37 @@ class FlightSQLClient:
             writer.done_writing()
             writer.close()
 
-            # 3. GetFlightInfo to get endpoints
+            # GetFlightInfo to get endpoints
             info = self._client.get_flight_info(descriptor, opts)
             if not info.endpoints:
                 return pa.table({})
 
-            # 4. DoGet to fetch results
+            # DoGet to fetch results
             ticket = info.endpoints[0].ticket
             reader = self._client.do_get(ticket, opts)
             return reader.read_all()
-        finally:
-            # 5. Close prepared statement
-            if handle is not None:
-                try:
-                    close_body = _close_prepared_statement_request(handle)
-                    close_action = flight.Action("ClosePreparedStatement", close_body)
-                    list(self._client.do_action(close_action, opts))
-                except Exception:
-                    pass  # best-effort cleanup
+        except Exception:
+            # Handle may have expired server-side; evict and retry once if cached
+            self._evict_handle(query)
+            if from_cache and _retry:
+                return self._execute_prepared(query, parameters, _retry=False)
+            raise
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def execute_query(self, query: str, parameters: Parameters = None) -> pa.Table:
-        """Execute a read query and return the full result as a :class:`pyarrow.Table`."""
+        """Execute a query and return the full result as a :class:`pyarrow.Table`.
+
+        When *parameters* are provided, the client first attempts the direct
+        path (params sent via ``x-params-json`` gRPC header — 2 RPCs).  If the
+        server returns ``Unimplemented``, it transparently falls back to the
+        prepared-statement path and remembers the result for future calls.
+        """
         try:
             if parameters is not None:
-                return self._execute_prepared(query, parameters)
+                return self._execute_with_params(query, parameters)
 
             descriptor = flight.FlightDescriptor.for_command(
                 _flight_sql_command(query),
@@ -286,41 +382,41 @@ class FlightSQLClient:
         except Exception as exc:
             raise QueryError(f"Query execution failed: {exc}") from exc
 
-    def execute_update(self, query: str, parameters: Parameters = None) -> int:
-        """Execute a DML statement and return the number of affected rows."""
+    def _execute_with_params(
+        self, query: str, parameters: Sequence[Any] | dict[str, Any],
+    ) -> pa.Table:
+        """Route parameterized queries to the direct or prepared-statement path."""
+        # Already know the server doesn't support direct params
+        if self._direct_params_supported is False:
+            return self._execute_prepared(query, parameters)
+
+        # Already confirmed direct params work
+        if self._direct_params_supported is True:
+            return self._execute_direct(query, parameters)
+
+        # First parameterized call — probe the server
         try:
-            if parameters is not None:
-                table = self._execute_prepared(query, parameters)
-            else:
-                opts = self._call_options()
-                descriptor = flight.FlightDescriptor.for_command(
-                    _flight_sql_command(query),
-                )
-                info = self._client.get_flight_info(descriptor, opts)
-
-                if not info.endpoints:
-                    return 0
-
-                ticket = info.endpoints[0].ticket
-                reader = self._client.do_get(ticket, opts)
-                table = reader.read_all()
-
-            # The server returns a single-row table with the affected count
-            # when the statement is DML. If it returns regular rows, return
-            # the row count instead.
-            if table.num_columns == 1 and table.column_names[0] == "affected_rows":
-                return int(table.column(0)[0].as_py())
-            return cast(int, table.num_rows)
-        except flight.FlightUnauthenticatedError as exc:
-            raise AuthenticationError(str(exc)) from exc
-        except QueryError:
+            result = self._execute_direct(query, parameters)
+            self._direct_params_supported = True
+            return result
+        except flight.FlightUnavailableError:
+            raise
+        except flight.FlightUnauthenticatedError:
             raise
         except Exception as exc:
-            raise QueryError(f"Update execution failed: {exc}") from exc
+            if "Unimplemented" in str(exc):
+                self._direct_params_supported = False
+                return self._execute_prepared(query, parameters)
+            raise
 
     def close(self) -> None:
-        """Close the underlying Flight client."""
+        """Close cached prepared statements and the underlying Flight client."""
         if not self._closed:
+            opts = self._call_options()
+            with self._cache_lock:
+                for handle, _ in self._handle_cache.values():
+                    self._close_prepared_async(handle, opts)
+                self._handle_cache.clear()
             self._client.close()
             self._closed = True
 

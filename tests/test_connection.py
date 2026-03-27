@@ -57,27 +57,18 @@ class TestDuckgresql:
     def test_execute_with_positional_parameters(
         self, conn: Duckgresql, mock_flight_client: MagicMock
     ) -> None:
-        """Positional params trigger the prepared statement flow."""
-        conn.execute("SELECT * FROM t WHERE id = $1", [42])
-
-        # Verify prepared statement flow was used (do_action called)
-        action_calls = mock_flight_client.do_action.call_args_list
-        assert len(action_calls) == 2
-        assert action_calls[0][0][0].type == "CreatePreparedStatement"
-        assert action_calls[1][0][0].type == "ClosePreparedStatement"
-        mock_flight_client.do_put.assert_called_once()
+        """Positional params return a result."""
+        result = conn.execute("SELECT * FROM t WHERE id = $1", [42])
+        assert isinstance(result, DuckgresqlResult)
+        assert result.rowcount == 3
 
     def test_execute_with_named_parameters(
         self, conn: Duckgresql, mock_flight_client: MagicMock
     ) -> None:
-        """Named dict params trigger the prepared statement flow."""
-        conn.execute("SELECT * FROM t WHERE id = $id", {"id": 42})
-
-        action_calls = mock_flight_client.do_action.call_args_list
-        assert len(action_calls) == 2
-        assert action_calls[0][0][0].type == "CreatePreparedStatement"
-        assert action_calls[1][0][0].type == "ClosePreparedStatement"
-        mock_flight_client.do_put.assert_called_once()
+        """Named dict params return a result."""
+        result = conn.execute("SELECT * FROM t WHERE id = $id", {"id": 42})
+        assert isinstance(result, DuckgresqlResult)
+        assert result.rowcount == 3
 
     def test_executemany(
         self, conn: Duckgresql, mock_flight_client: MagicMock
@@ -92,9 +83,6 @@ class TestDuckgresql:
             [[1], [2], [3]],
         )
         assert result.rowcount == 3
-        # Each call uses the prepared statement flow (2 do_action calls each)
-        assert mock_flight_client.do_action.call_count == 6  # 3 * (create + close)
-        assert mock_flight_client.do_put.call_count == 3
 
     def test_executemany_with_named_parameters(
         self, conn: Duckgresql, mock_flight_client: MagicMock
@@ -109,7 +97,6 @@ class TestDuckgresql:
             [{"id": 1}, {"id": 2}],
         )
         assert result.rowcount == 2
-        assert mock_flight_client.do_action.call_count == 4  # 2 * (create + close)
 
     def test_execute_async_returns_job(self, conn: Duckgresql) -> None:
         mock_resp = MagicMock()

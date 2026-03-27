@@ -17,7 +17,6 @@ def async_conn(sample_table: pa.Table) -> DuckgresqlAsync:
     """Create a DuckgresqlAsync with mocked internals."""
     mock_flight = MagicMock()
     mock_flight.execute_query.return_value = sample_table
-    mock_flight.execute_update.return_value = 1
     mock_flight.closed = False
 
     mock_rest = MagicMock()
@@ -37,6 +36,8 @@ class TestDuckgresqlAsync:
 
     @pytest.mark.asyncio
     async def test_execute_insert(self, async_conn: DuckgresqlAsync) -> None:
+        affected_table = pa.table({"affected_rows": [1]})
+        async_conn._flight.execute_query.return_value = affected_table
         result = await async_conn.execute("INSERT INTO t VALUES (1)")
         assert result.rowcount == 1
 
@@ -47,6 +48,8 @@ class TestDuckgresqlAsync:
 
     @pytest.mark.asyncio
     async def test_executemany(self, async_conn: DuckgresqlAsync) -> None:
+        affected_table = pa.table({"affected_rows": [1]})
+        async_conn._flight.execute_query.return_value = affected_table
         result = await async_conn.executemany(
             "INSERT INTO t (id) VALUES ($1)",
             [[1], [2]],

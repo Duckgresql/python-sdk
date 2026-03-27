@@ -14,7 +14,6 @@ from duckgresql._config import (
 )
 from duckgresql._flight import FlightSQLClient, Parameters
 from duckgresql._rest import RestClient
-from duckgresql._types import _is_read_query
 from duckgresql.async_job import AsyncJob
 from duckgresql.exceptions import ConnectionError
 from duckgresql.result import DuckgresqlResult
@@ -75,12 +74,8 @@ class Duckgresql:
         (``$name``).
         """
         self._ensure_open()
-        if _is_read_query(query):
-            table = self._flight.execute_query(query, parameters)
-            return DuckgresqlResult(table)
-        else:
-            affected = self._flight.execute_update(query, parameters)
-            return DuckgresqlResult(affected_rows=affected)
+        table = self._flight.execute_query(query, parameters)
+        return DuckgresqlResult(table)
 
     def sql(
         self,
@@ -99,7 +94,9 @@ class Duckgresql:
         self._ensure_open()
         total_affected = 0
         for params in parameters_list:
-            total_affected += self._flight.execute_update(query, params)
+            table = self._flight.execute_query(query, params)
+            result = DuckgresqlResult(table)
+            total_affected += result.rowcount
         return DuckgresqlResult(affected_rows=total_affected)
 
     def execute_async(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock
 
 import pyarrow as pa
@@ -25,18 +26,6 @@ class TestFlightSQLClient:
         client = FlightSQLClient("localhost", 47470, "tok", "db")
         result = client.execute_query("SELECT 1")
         assert result.num_rows == sample_table.num_rows
-        client.close()
-
-    def test_execute_update(self, mock_flight_client: MagicMock) -> None:
-        # Make do_get return a table with affected_rows column
-        affected_table = pa.table({"affected_rows": [5]})
-        mock_reader = MagicMock()
-        mock_reader.read_all.return_value = affected_table
-        mock_flight_client.do_get.return_value = mock_reader
-
-        client = FlightSQLClient("localhost", 47470, "tok", "db")
-        count = client.execute_update("INSERT INTO t VALUES (1)")
-        assert count == 5
         client.close()
 
     def test_auth_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,74 +75,226 @@ class TestFlightSqlCommand:
         mock_flight_client.do_action.assert_not_called()
 
 
-class TestPreparedStatementFlow:
-    def test_execute_query_with_positional_parameters(
+class TestDirectParamsPath:
+    """Tests for the direct parameter path (x-params-json header, 2 RPCs)."""
+
+    def test_direct_path_used_when_server_supports_it(
         self, mock_flight_client: MagicMock, sample_table: pa.Table
     ) -> None:
-        """Positional params trigger the prepared statement flow."""
+        """When get_flight_info succeeds with params header, no prepared statement RPCs."""
         client = FlightSQLClient("localhost", 47470, "tok", "db")
         result = client.execute_query("SELECT * FROM t WHERE id = $1", [42])
 
         assert result.num_rows == sample_table.num_rows
-
-        # Verify the full sequence: create → bind (do_put) → execute → close
-        action_calls = mock_flight_client.do_action.call_args_list
-        assert len(action_calls) == 2
-        assert action_calls[0][0][0].type == "CreatePreparedStatement"
-        assert action_calls[1][0][0].type == "ClosePreparedStatement"
-
-        mock_flight_client.do_put.assert_called_once()
+        # No prepared statement RPCs
+        mock_flight_client.do_action.assert_not_called()
+        mock_flight_client.do_put.assert_not_called()
+        # Direct path: get_flight_info + do_get
         mock_flight_client.get_flight_info.assert_called_once()
         mock_flight_client.do_get.assert_called_once()
 
-    def test_execute_query_with_named_parameters(
+    def test_direct_path_sends_x_params_json_header(
         self, mock_flight_client: MagicMock, sample_table: pa.Table
     ) -> None:
-        """Named dict params trigger the prepared statement flow."""
+        """Positional params are encoded as a plain JSON array."""
+        import base64
+        import json
+
         client = FlightSQLClient("localhost", 47470, "tok", "db")
+        client.execute_query("SELECT $1", [42])
+
+        call_opts = mock_flight_client.get_flight_info.call_args[1].get("options") or \
+            mock_flight_client.get_flight_info.call_args[0][1]
+        headers = {k: v for k, v in call_opts.headers}
+        assert b"x-params-json" in headers
+        decoded = json.loads(base64.b64decode(headers[b"x-params-json"]))
+        assert decoded == [{"v": 42}]
+
+    def test_direct_path_with_named_params(
+        self, mock_flight_client: MagicMock, sample_table: pa.Table
+    ) -> None:
+        """Named params are encoded as an array of single-key objects."""
+        import base64
+        import json
+
+        client = FlightSQLClient("localhost", 47470, "tok", "db")
+        client.execute_query("SELECT $name", {"name": "alice"})
+
+        call_opts = mock_flight_client.get_flight_info.call_args[0][1]
+        headers = {k: v for k, v in call_opts.headers}
+        decoded = json.loads(base64.b64decode(headers[b"x-params-json"]))
+        assert decoded == [{"n": "name", "v": "alice"}]
+
+    def test_fallback_to_prepared_on_unimplemented(
+        self, mock_flight_client: MagicMock, sample_table: pa.Table
+    ) -> None:
+        """Server returning Unimplemented triggers fallback to prepared statements."""
+        original_return = mock_flight_client.get_flight_info.return_value
+        call_count = 0
+
+        def unimplemented_then_ok(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # First call (direct probe) fails with Unimplemented
+            if call_count == 1:
+                raise RuntimeError("Unimplemented: direct params not supported")
+            return original_return
+
+        mock_flight_client.get_flight_info.side_effect = unimplemented_then_ok
+
+        client = FlightSQLClient("localhost", 47470, "tok", "db")
+        result = client.execute_query("SELECT $1", [42])
+
+        assert result.num_rows == sample_table.num_rows
+        assert client._direct_params_supported is False
+        # Fell back to prepared statement path
+        action_calls = mock_flight_client.do_action.call_args_list
+        assert action_calls[0][0][0].type == "CreatePreparedStatement"
+
+    def test_direct_support_remembered(
+        self, mock_flight_client: MagicMock, sample_table: pa.Table
+    ) -> None:
+        """After successful probe, direct path is used without re-probing."""
+        client = FlightSQLClient("localhost", 47470, "tok", "db")
+        client.execute_query("SELECT $1", [1])
+        client.execute_query("SELECT $1", [2])
+
+        assert client._direct_params_supported is True
+        mock_flight_client.do_action.assert_not_called()
+        assert mock_flight_client.get_flight_info.call_count == 2
+
+    def test_fallback_remembered(
+        self, mock_flight_client: MagicMock, sample_table: pa.Table
+    ) -> None:
+        """After Unimplemented fallback, prepared path is used without re-probing."""
+        original_return = mock_flight_client.get_flight_info.return_value
+
+        def unimplemented_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("Unimplemented")
+            return original_return
+
+        call_count = 0
+        mock_flight_client.get_flight_info.side_effect = unimplemented_once
+
+        client = FlightSQLClient("localhost", 47470, "tok", "db")
+        client.execute_query("SELECT $1", [1])  # probe fails, falls back
+        assert client._direct_params_supported is False
+
+        # Second call goes straight to prepared path (no re-probe)
+        mock_flight_client.get_flight_info.side_effect = None
+        mock_flight_client.get_flight_info.return_value = original_return
+        client.execute_query("SELECT $1", [2])
+
+        # Two Creates total (one per call, since different params don't matter —
+        # same query uses cached handle for second call)
+        create_calls = [c for c in mock_flight_client.do_action.call_args_list
+                        if c[0][0].type == "CreatePreparedStatement"]
+        assert len(create_calls) == 1  # handle reused
+
+
+class TestPreparedStatementFlow:
+    """Tests for the prepared statement path (used when direct params not supported)."""
+
+    @pytest.fixture(autouse=True)
+    def _force_prepared_path(self, mock_flight_client: MagicMock) -> None:
+        """Force all clients in this class to use the prepared statement path."""
+        self._mock_flight_client = mock_flight_client
+
+    def _make_client(self) -> FlightSQLClient:
+        client = FlightSQLClient("localhost", 47470, "tok", "db")
+        client._direct_params_supported = False
+        return client
+
+    def test_execute_query_with_positional_parameters(
+        self, sample_table: pa.Table
+    ) -> None:
+        client = self._make_client()
+        result = client.execute_query("SELECT * FROM t WHERE id = $1", [42])
+
+        assert result.num_rows == sample_table.num_rows
+
+        action_calls = self._mock_flight_client.do_action.call_args_list
+        assert len(action_calls) == 1
+        assert action_calls[0][0][0].type == "CreatePreparedStatement"
+
+        self._mock_flight_client.do_put.assert_called_once()
+        self._mock_flight_client.get_flight_info.assert_called_once()
+        self._mock_flight_client.do_get.assert_called_once()
+
+    def test_execute_query_with_named_parameters(
+        self, sample_table: pa.Table
+    ) -> None:
+        client = self._make_client()
         result = client.execute_query("SELECT * FROM t WHERE id = $id", {"id": 42})
 
         assert result.num_rows == sample_table.num_rows
 
-        action_calls = mock_flight_client.do_action.call_args_list
-        assert len(action_calls) == 2
+        action_calls = self._mock_flight_client.do_action.call_args_list
+        assert len(action_calls) == 1
         assert action_calls[0][0][0].type == "CreatePreparedStatement"
-        assert action_calls[1][0][0].type == "ClosePreparedStatement"
 
-    def test_execute_update_with_parameters(
-        self, mock_flight_client: MagicMock
+    def test_cached_handle_reused(
+        self, sample_table: pa.Table
     ) -> None:
-        """execute_update with params uses prepared statement flow."""
-        affected_table = pa.table({"affected_rows": [1]})
-        mock_reader = MagicMock()
-        mock_reader.read_all.return_value = affected_table
-        mock_flight_client.do_get.return_value = mock_reader
+        client = self._make_client()
+        client.execute_query("SELECT * FROM t WHERE id = $1", [42])
+        client.execute_query("SELECT * FROM t WHERE id = $1", [99])
 
-        client = FlightSQLClient("localhost", 47470, "tok", "db")
-        count = client.execute_update(
-            "INSERT INTO t (id) VALUES ($id)", {"id": 99},
-        )
+        action_calls = self._mock_flight_client.do_action.call_args_list
+        assert len(action_calls) == 1
+        assert self._mock_flight_client.do_put.call_count == 2
 
-        assert count == 1
-        action_calls = mock_flight_client.do_action.call_args_list
-        assert len(action_calls) == 2
-        assert action_calls[0][0][0].type == "CreatePreparedStatement"
-        assert action_calls[1][0][0].type == "ClosePreparedStatement"
-
-    def test_close_called_on_error(
-        self, mock_flight_client: MagicMock
+    def test_different_queries_get_separate_handles(
+        self, sample_table: pa.Table
     ) -> None:
-        """ClosePreparedStatement is called even when GetFlightInfo fails."""
-        mock_flight_client.get_flight_info.side_effect = RuntimeError("boom")
+        client = self._make_client()
+        client.execute_query("SELECT * FROM t WHERE id = $1", [1])
+        client.execute_query("SELECT * FROM t WHERE name = $1", ["alice"])
 
-        client = FlightSQLClient("localhost", 47470, "tok", "db")
-        with pytest.raises(QueryError, match="boom"):
-            client.execute_query("SELECT $1", [1])
-
-        # Close should still be called
-        action_calls = mock_flight_client.do_action.call_args_list
+        action_calls = self._mock_flight_client.do_action.call_args_list
         assert len(action_calls) == 2
-        assert action_calls[1][0][0].type == "ClosePreparedStatement"
+
+    def test_handle_evicted_and_retried_on_error(
+        self, sample_table: pa.Table
+    ) -> None:
+        client = self._make_client()
+
+        client.execute_query("SELECT $1", [1])
+        assert self._mock_flight_client.do_action.call_count == 1
+
+        original_return = self._mock_flight_client.get_flight_info.return_value
+        call_count = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("handle expired")
+            return original_return
+
+        self._mock_flight_client.get_flight_info.side_effect = fail_once
+
+        result = client.execute_query("SELECT $1", [2])
+        assert result.num_rows == sample_table.num_rows
+        assert self._mock_flight_client.do_action.call_count == 2
+
+    def test_close_cleans_up_cached_handles(
+        self, sample_table: pa.Table
+    ) -> None:
+        client = self._make_client()
+        client.execute_query("SELECT $1", [1])
+        client.execute_query("SELECT $name", {"name": "x"})
+
+        assert self._mock_flight_client.do_action.call_count == 2
+        client.close()
+
+        time.sleep(0.05)
+        action_calls = self._mock_flight_client.do_action.call_args_list
+        close_calls = [c for c in action_calls if c[0][0].type == "ClosePreparedStatement"]
+        assert len(close_calls) == 2
 
 
 class TestBuildParamsBatch:

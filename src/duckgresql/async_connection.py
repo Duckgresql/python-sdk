@@ -15,7 +15,6 @@ from duckgresql._config import (
 )
 from duckgresql._flight import FlightSQLClient, Parameters
 from duckgresql._rest_async import AsyncRestClient
-from duckgresql._types import _is_read_query
 from duckgresql.async_job import AsyncJobAsync
 from duckgresql.exceptions import ConnectionError
 from duckgresql.result import DuckgresqlResult
@@ -83,16 +82,10 @@ class DuckgresqlAsync:
         """Execute *query* via Flight SQL (in a thread) and return a result."""
         self._ensure_open()
 
-        if _is_read_query(query):
-            table = await asyncio.to_thread(
-                self._flight.execute_query, query, parameters,
-            )
-            return DuckgresqlResult(table)
-        else:
-            affected = await asyncio.to_thread(
-                self._flight.execute_update, query, parameters,
-            )
-            return DuckgresqlResult(affected_rows=affected)
+        table = await asyncio.to_thread(
+            self._flight.execute_query, query, parameters,
+        )
+        return DuckgresqlResult(table)
 
     async def sql(
         self,
@@ -111,10 +104,11 @@ class DuckgresqlAsync:
         self._ensure_open()
         total_affected = 0
         for params in parameters_list:
-            affected = await asyncio.to_thread(
-                self._flight.execute_update, query, params,
+            table = await asyncio.to_thread(
+                self._flight.execute_query, query, params,
             )
-            total_affected += affected
+            result = DuckgresqlResult(table)
+            total_affected += result.rowcount
         return DuckgresqlResult(affected_rows=total_affected)
 
     async def execute_async(

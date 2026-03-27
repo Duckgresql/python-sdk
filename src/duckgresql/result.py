@@ -22,8 +22,20 @@ class DuckgresqlResult:
         affected_rows: int | None = None,
     ) -> None:
         self._table: pa.Table = table if table is not None else pa.table({})
-        self._affected_rows = affected_rows
         self._cursor: int = 0
+
+        # Auto-detect DML results: server returns a single-row table with
+        # an "affected_rows" column for write statements.
+        if affected_rows is not None:
+            self._affected_rows = affected_rows
+        elif (
+            self._table.num_columns == 1
+            and self._table.column_names[0] == "affected_rows"
+            and self._table.num_rows == 1
+        ):
+            self._affected_rows = int(self._table.column(0)[0].as_py())
+        else:
+            self._affected_rows = None
 
     # ------------------------------------------------------------------
     # DB-API 2.0-style properties
